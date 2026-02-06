@@ -146,7 +146,38 @@ class HttpEventPublisher @Inject() (
           case RoutedDestination.Revert(baseDest) => s"$baseDest.revert"
         }
     }
-    publishWithDestinations(event, destinations, RoutingContext(), List.empty, configuredOrder)
+
+    // 3. Query for prior successful forward results to support resume-from-failure
+    //    On retry, skip destinations that already succeeded and reconstruct RoutingContext
+    //    from saved response payloads so conditional routing still works
+    db.run(resultRepo.findSuccessfulForwardsByEventType(event.aggregateId, event.eventType)).flatMap { priorResults =>
+      if (priorResults.isEmpty) {
+        // First attempt or no prior successes — proceed normally
+        publishWithDestinations(event, destinations, RoutingContext(), List.empty, configuredOrder)
+      } else {
+        // Reconstruct RoutingContext from saved response payloads
+        val routingContext = RoutingContext(
+          priorResults.flatMap(r => r.responsePayload.map(r.destination -> _)).toMap
+        )
+
+        // Collect the set of already-succeeded destination names
+        val succeededDestinations = priorResults.map(_.destination).toSet
+
+        logger.info(
+          s"Resuming event ${event.eventType} for aggregate ${event.aggregateId} — " +
+            s"skipping already-succeeded destinations: [${succeededDestinations.mkString(", ")}]"
+        )
+
+        // Filter out Forward destinations that already succeeded; always keep Revert destinations
+        val remainingDestinations = destinations.filter {
+          case RoutedDestination.Forward(endpoint) =>
+            !succeededDestinations.contains(endpoint.destinationName)
+          case RoutedDestination.Revert(_) => true
+        }
+
+        publishWithDestinations(event, remainingDestinations, routingContext, List.empty, configuredOrder)
+      }
+    }
   }
 
   /** Publishes to specific endpoints (used for revert operations where endpoints are pre-determined).

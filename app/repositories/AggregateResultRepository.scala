@@ -247,20 +247,21 @@ class DestinationResultRepository @Inject() ()(using ec: ExecutionContext) {
     * @return Sequence of results sorted by publishedAt DESC (newest first)
     */
   def findByAggregateId(
-                         aggregateId: String,
-                         filter: Result = Result.All,
-                         includeReverts: Boolean = true
+      aggregateId: String,
+      filter: Result          = Result.All,
+      includeReverts: Boolean = true
   ): DBIO[Seq[AggregateResult]] = {
     val baseQuery = results.filter(_.aggregateId === aggregateId)
 
     // For DLQ revert processing, exclude revert events to only see forward flow results
     // For UI display, include both forward and revert events
-    val revertFilteredQuery = if (includeReverts) baseQuery else baseQuery.filterNot(_.eventType like "%:REVERT")
+    val revertFilteredQuery =
+      if (includeReverts) baseQuery else baseQuery.filterNot(_.eventType like "%:REVERT")
 
     val filteredQuery = filter match {
       case Result.Success => revertFilteredQuery.filter(_.success === true)
-      case Result.Failed  => revertFilteredQuery.filter(_.success === false)
-      case Result.All     => revertFilteredQuery
+      case Result.Failed => revertFilteredQuery.filter(_.success === false)
+      case Result.All => revertFilteredQuery
     }
     filteredQuery.sortBy(_.publishedAt.desc).result
   }
@@ -314,12 +315,15 @@ class DestinationResultRepository @Inject() ()(using ec: ExecutionContext) {
     * @param destination The base destination name (e.g., "billing", NOT "billing.revert")
     * @return The most recent successful forward result, or None if not found
     */
-  def findSuccessfulForward(aggregateId: String, destination: String): DBIO[Option[AggregateResult]] =
+  def findSuccessfulForward(
+      aggregateId: String,
+      destination: String
+  ): DBIO[Option[AggregateResult]] =
     results
       .filter(r =>
         r.aggregateId === aggregateId &&
-        r.destination === destination &&
-        r.success === true
+          r.destination === destination &&
+          r.success === true
       )
       .sortBy(_.publishedAt.desc)
       .take(1)
@@ -373,15 +377,41 @@ class DestinationResultRepository @Inject() ()(using ec: ExecutionContext) {
     * @param baseDestination The base destination name (e.g., "billing", NOT "billing.revert")
     * @return The revert result if already compensated, or None if not yet compensated
     */
-  def findSuccessfulRevert(aggregateId: String, baseDestination: String): DBIO[Option[AggregateResult]] =
+  def findSuccessfulRevert(
+      aggregateId: String,
+      baseDestination: String
+  ): DBIO[Option[AggregateResult]] =
     results
       .filter(r =>
         r.aggregateId === aggregateId &&
-        r.destination === s"$baseDestination.revert" &&
-        r.success === true
+          r.destination === s"$baseDestination.revert" &&
+          r.success === true
       )
       .sortBy(_.publishedAt.desc)
       .take(1)
       .result
       .headOption
+
+  /** Finds all successful forward results for a specific aggregate and event type.
+    *
+    * Used during retry to identify destinations that already succeeded, so they can be skipped.
+    * The RoutingContext is reconstructed from saved response_payloads to support conditional routing
+    * even when prior destinations are skipped.
+    *
+    * @param aggregateId The aggregate ID (e.g., "123" for order 123)
+    * @param eventType   The event type to filter by (e.g., "OrderCreated")
+    * @return Successful forward results ordered by fanout_order
+    */
+  def findSuccessfulForwardsByEventType(
+      aggregateId: String,
+      eventType: String
+  ): DBIO[Seq[AggregateResult]] =
+    results
+      .filter(r =>
+        r.aggregateId === aggregateId &&
+          r.eventType === eventType &&
+          r.success === true
+      )
+      .sortBy(_.fanoutOrder)
+      .result
 }

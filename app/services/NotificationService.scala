@@ -1,16 +1,16 @@
 package services
 
 import actors.OutboxProcessor
-import org.apache.pekko.actor.typed.{ ActorRef, ActorSystem }
+import org.apache.pekko.actor.typed.{ActorRef, ActorSystem}
 import org.apache.pekko.stream.UniqueKillSwitch
-import org.apache.pekko.stream.scaladsl.{ Keep, Sink }
+import org.apache.pekko.stream.scaladsl.{Keep, Sink}
 import play.api.inject.ApplicationLifecycle
-import play.api.{ Configuration, Logging }
+import play.api.{Configuration, Logging}
 import slick.jdbc.JdbcBackend.Database
 
 import javax.inject.*
-import scala.concurrent.ExecutionContext
-import scala.util.{ Failure, Success }
+import scala.concurrent.*
+import scala.util.{Failure, Success}
 
 /** PostgreSQL LISTEN/NOTIFY notification service for near-instant event processing.
   *
@@ -238,6 +238,6 @@ class NotificationService @Inject() (
       logger.info("Shutting down LISTEN/NOTIFY streams")
       ks.shutdown()
     }
-    scala.concurrent.Future.successful(())
+    Future.successful(())
   }
 }
