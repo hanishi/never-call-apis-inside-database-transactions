@@ -24,7 +24,7 @@
                         if (!ordersDiv || !createBtn) return;
 
                         // Check if there are any order items in the orders list
-                        const hasOrders = ordersDiv.querySelector('.order-item') !== null;
+                        const hasOrders = ordersDiv.querySelector('.pipeline-card') !== null;
 
                         if (hasOrders) {
                             createBtn.disabled = true;
@@ -212,26 +212,6 @@
                     border-radius: 8px;
                 }
 
-                .orders-list {
-                    max-height: 400px;
-                    overflow-y: auto;
-                }
-
-                .order-item {
-                    background: #f7fafc;
-                    padding: 1rem;
-                    margin-bottom: 0.75rem;
-                    border-radius: 8px;
-                    border-left: 4px solid #667eea;
-                }
-
-                .order-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 0.5rem;
-                }
-
                 .order-id {
                     font-weight: bold;
                     color: #667eea;
@@ -265,25 +245,218 @@
                     color: #44337a;
                 }
 
-                .btn-status {
-                    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-                }
-
                 .status-cancelled {
                     background: #fed7d7;
                     color: #742a2a;
                 }
 
-                .order-actions {
+                /* Pipeline Visualization */
+                .pipeline-card {
+                    background: #f7fafc;
+                    border-radius: 12px;
+                    padding: 1.25rem;
+                    margin-bottom: 1rem;
+                }
+
+                .pipeline-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 0.75rem;
+                }
+
+                .pipeline-meta {
+                    color: #718096;
+                    font-size: 0.813rem;
+                    margin-left: 0.75rem;
+                }
+
+                .pipeline-grid {
+                    display: grid;
+                    grid-template-columns: auto 28px auto 28px auto 28px auto 28px auto 28px auto;
+                    align-items: center;
+                    row-gap: 0.5rem;
+                    padding: 0.5rem 0;
+                }
+
+                .pipeline-node {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    padding: 0.5rem 0.625rem;
+                    border-radius: 10px;
+                    border: 2px solid;
+                    min-width: 76px;
+                    background: white;
+                    flex-shrink: 0;
+                    position: relative;
+                    transition: border-color 0.3s, background 0.3s, opacity 0.3s;
+                }
+
+                .node-icon { font-size: 1.125rem; line-height: 1; }
+                .node-label { font-size: 0.688rem; font-weight: 600; margin-top: 0.25rem; color: #374151; }
+                .node-sub { font-size: 0.625rem; margin-top: 0.125rem; color: #6B7280; }
+
+                /* Node States */
+                .node-waiting {
+                    border-color: #D1D5DB;
+                    opacity: 0.5;
+                }
+
+                .node-processing {
+                    border-color: #3B82F6;
+                    background: #EFF6FF;
+                    animation: pulse 2s ease-in-out infinite;
+                }
+                .node-processing .node-sub { color: #3B82F6; }
+
+                .node-success {
+                    border-color: #10B981;
+                    background: #F0FDF4;
+                }
+                .node-success .node-sub { color: #059669; }
+
+                .node-failed {
+                    border-color: #EF4444;
+                    background: #FEF2F2;
+                }
+                .node-failed .node-sub { color: #DC2626; }
+
+                .node-reverted {
+                    border-color: #8B5CF6;
+                    background: #F5F3FF;
+                }
+                .node-reverted .node-sub { color: #7C3AED; }
+
+                .node-skipped {
+                    border-color: #D1D5DB;
+                    opacity: 0.6;
+                }
+                .node-skipped .node-sub { color: #9CA3AF; }
+
+                /* Connectors */
+                .pipeline-connector {
+                    flex: 0 0 28px;
+                    height: 2px;
+                    position: relative;
+                    background: var(--connector-color, #D1D5DB);
+                }
+
+                .pipeline-connector::after {
+                    content: '';
+                    position: absolute;
+                    right: 0;
+                    top: -4px;
+                    border: 5px solid transparent;
+                    border-left: 6px solid var(--connector-color, #D1D5DB);
+                    border-right: 0;
+                }
+
+                .connector-waiting { --connector-color: #D1D5DB; }
+                .connector-processing {
+                    --connector-color: #3B82F6;
+                    background: linear-gradient(90deg, #3B82F6 0%, #93C5FD 50%, #3B82F6 100%);
+                    background-size: 200% 100%;
+                    animation: flow 1.5s linear infinite;
+                }
+                .connector-processing::after { border-left-color: #3B82F6; }
+                .connector-success { --connector-color: #10B981; }
+                .connector-failed { --connector-color: #EF4444; }
+                .connector-reverted { --connector-color: #8B5CF6; }
+                .connector-skipped { --connector-color: #D1D5DB; }
+
+                /* Compensation */
+                .comp-drop {
+                    justify-self: center;
+                    width: 2px;
+                    height: 20px;
+                    background: #EF4444;
+                }
+
+                .compensation-label {
+                    font-size: 0.75rem;
+                    color: #7C3AED;
+                    font-weight: 600;
+                    text-align: right;
+                    align-self: center;
+                }
+
+                .comp-connector::after {
+                    right: auto;
+                    left: 0;
+                    border-left: 0;
+                    border-right: 6px solid var(--connector-color, #D1D5DB);
+                }
+
+                /* Tooltip */
+                .node-tooltip {
+                    display: none;
+                    position: absolute;
+                    bottom: calc(100% + 8px);
+                    left: 50%;
+                    transform: translateX(-50%);
+                    background: #1F2937;
+                    color: #F9FAFB;
+                    padding: 0.5rem 0.75rem;
+                    border-radius: 6px;
+                    font-size: 0.688rem;
+                    white-space: nowrap;
+                    z-index: 10;
+                    line-height: 1.4;
+                    pointer-events: none;
+                }
+
+                .node-tooltip::after {
+                    content: '';
+                    position: absolute;
+                    top: 100%;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    border: 5px solid transparent;
+                    border-top-color: #1F2937;
+                }
+
+                .pipeline-node:hover .node-tooltip {
+                    display: block;
+                }
+
+                /* Animations */
+                @@keyframes pulse {
+                    0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
+                    50% { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
+                }
+
+                @@keyframes flow {
+                    0% { background-position: 200% 0; }
+                    100% { background-position: -200% 0; }
+                }
+
+                /* Pipeline Actions */
+                .pipeline-actions {
                     display: flex;
                     gap: 0.5rem;
                     margin-top: 0.75rem;
+                    padding-top: 0.75rem;
+                    border-top: 1px solid #E5E7EB;
                 }
 
-                .order-actions button {
+                .pipeline-actions button {
                     flex: 1;
                     padding: 0.5rem;
                     font-size: 0.875rem;
+                }
+
+                /* Responsive */
+                @@media (max-width: 768px) {
+                    .pipeline-grid {
+                        grid-template-columns: auto 16px auto 16px auto 16px auto 16px auto 16px auto;
+                    }
+                    .pipeline-node {
+                        min-width: 60px;
+                        padding: 0.375rem 0.5rem;
+                    }
+                    .node-icon { font-size: 1rem; }
+                    .node-label { font-size: 0.625rem; }
                 }
 
                 .htmx-indicator {

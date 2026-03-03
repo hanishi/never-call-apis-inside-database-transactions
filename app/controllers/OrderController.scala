@@ -89,6 +89,36 @@ class OrderController @Inject() (
       }
   }
 
+  // Pipeline visualization helpers
+  private val fanoutDests    = Seq("inventory", "fraudCheck", "shipping", "billing")
+  private val noRevertDests  = Set("fraudCheck")
+  private val destIcons = Map(
+    "inventory"  -> "🏭",
+    "fraudCheck" -> "🔍",
+    "shipping"   -> "🚚",
+    "billing"    -> "💳"
+  )
+
+  private def pipelineNode(
+      icon: String,
+      label: String,
+      state: String,
+      sub: String,
+      tooltip: Option[String] = None,
+      style: String = ""
+  ): String = {
+    val styleAttr   = if (style.nonEmpty) s""" style="$style"""" else ""
+    val tooltipHtml = tooltip
+      .map(t => s"""<div class="node-tooltip">$t</div>""")
+      .getOrElse("")
+    s"""<div class="pipeline-node node-$state"$styleAttr>
+      <div class="node-icon">$icon</div>
+      <div class="node-label">$label</div>
+      <div class="node-sub">$sub</div>
+      $tooltipHtml
+    </div>"""
+  }
+
   def listOrders: Action[AnyContent] = Action.async {
     orderService
       .listOrdersWithResults(10, 0)
@@ -101,164 +131,240 @@ class OrderController @Inject() (
         } else {
           val html = ordersWithResults
             .map { case models.OrderWithResults(order, results) =>
-              val publishResults = results
+              // Separate forward and revert results
+              val forwardResults = results
                 .filter(r => !r.eventType.endsWith(":REVERT") && !r.destination.endsWith(".revert"))
-              val allSucceeded = publishResults.nonEmpty && publishResults.forall(_.success)
-
               val revertResults = results
                 .filter(r => r.eventType.endsWith(":REVERT") || r.destination.endsWith(".revert"))
-              val hasReverts = revertResults.nonEmpty
 
-              val allFailed = publishResults.nonEmpty && publishResults.forall(!_.success)
+              val allSucceeded = forwardResults.nonEmpty && forwardResults.forall(_.success)
+              val hasReverts   = revertResults.nonEmpty
+              val allFailed    = forwardResults.nonEmpty && forwardResults.forall(!_.success)
 
-              val buttonsHtml = order.orderStatus match {
-                case "DELIVERED" =>
-                  // Order delivered - show remove button
-                  s"""
-            <div class="order-actions">
-              <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
-            </div>
-            """
-                case "SHIPPED" =>
-                  // Order shipped - allow marking as delivered (triggers review request notification)
-                  s"""
-            <div class="order-actions">
-              <button class="btn-secondary" hx-put="/orders/${order.id}/status" hx-target="#orders" hx-swap="innerHTML" hx-vals='{"status":"DELIVERED"}'>📦 Mark as Delivered</button>
-              <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
-            </div>
-            """
-                case "CANCELLED" =>
-                  s"""
-            <div class="order-actions">
-              <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
-            </div>
-            """
-                case "PENDING" if publishResults.isEmpty =>
-                  // No results yet - order just created, still processing
-                  s"""
-            <div class="order-actions">
-              <div style="font-size: 0.875rem; color: #6B7280; font-style: italic;">Publishing in progress...</div>
-            </div>
-            """
-                case "PENDING" if allSucceeded =>
-                  // Forward events succeeded - allow marking as shipped (triggers shipping confirmation notification)
-                  s"""
-            <div class="order-actions">
-              <button class="btn-secondary" hx-put="/orders/${order.id}/status" hx-target="#orders" hx-swap="innerHTML" hx-vals='{"status":"SHIPPED"}'>🚚 Mark as Shipped</button>
-              <button class="btn-danger" hx-delete="/orders/${order.id}/cancel" hx-target="#orders" hx-swap="innerHTML">Cancel</button>
-            </div>
-            """
-                case "PENDING" if allFailed =>
-                  // All forward events failed - allow remove/retry
-                  s"""
-            <div class="order-actions">
-              <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
-            </div>
-            """
-                case "PENDING" if hasReverts =>
-                  s"""
-            <div class="order-actions">
-              <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
-            </div>
-            """
-                case _ =>
-                  s"""
-            <div class="order-actions">
-              <div style="font-size: 0.875rem; color: #EF4444; font-style: italic;">Processing...</div>
-            </div>
-            """
+              // Deduplicate forward results by destination (keep latest)
+              val forwardByDest = forwardResults
+                .filter(r => fanoutDests.contains(r.destination))
+                .groupBy(_.destination)
+                .view
+                .mapValues(_.maxBy(_.publishedAt))
+                .toMap
+
+              // Deduplicate revert results by base destination
+              val revertByDest = revertResults
+                .filter(r => fanoutDests.contains(r.destination.stripSuffix(".revert")))
+                .groupBy(r => r.destination.stripSuffix(".revert"))
+                .view
+                .mapValues(_.maxBy(_.publishedAt))
+                .toMap
+
+              // --- Forward row node states ---
+              val outboxState =
+                if (forwardByDest.nonEmpty) "success" else "processing"
+
+              val destStates = fanoutDests
+                .foldLeft(
+                  (Seq.empty[(String, String, Option[models.AggregateResult])], true)
+                ) { case ((acc, canBeNext), dest) =>
+                  forwardByDest.get(dest) match {
+                    case Some(r) if r.success =>
+                      (acc :+ ("success", dest, Some(r)), canBeNext)
+                    case Some(r) =>
+                      (acc :+ ("failed", dest, Some(r)), false)
+                    case None if canBeNext && forwardByDest.nonEmpty =>
+                      (acc :+ ("processing", dest, None), false)
+                    case None =>
+                      (acc :+ ("waiting", dest, None), false)
+                  }
+                }
+                ._1
+
+              // --- Build pipeline grid ---
+              val gridItems = scala.collection.mutable.ArrayBuffer.empty[String]
+
+              // Row 1: Forward flow
+              gridItems += pipelineNode(
+                "📦", "Order", "success", "✓",
+                style = "grid-column:1;grid-row:1"
+              )
+              gridItems += s"""<div class="pipeline-connector connector-$outboxState" style="grid-column:2;grid-row:1"></div>"""
+              gridItems += pipelineNode(
+                "📤", "Outbox", outboxState,
+                if (outboxState == "success") "✓" else "...",
+                style = "grid-column:3;grid-row:1"
+              )
+
+              destStates.zipWithIndex.foreach { case ((state, dest, resultOpt), idx) =>
+                val connCol = 2 * idx + 4
+                val nodeCol = 2 * idx + 5
+                val icon    = destIcons.getOrElse(dest, "📋")
+                val sub = state match {
+                  case "success" =>
+                    s"✓ ${resultOpt.flatMap(_.responseStatus).map(_.toString).getOrElse("")}"
+                  case "failed" =>
+                    s"✗ ${resultOpt.flatMap(_.responseStatus).map(_.toString).getOrElse("")}"
+                  case "processing" => "..."
+                  case _            => ""
+                }
+                val tooltip = resultOpt.map { r =>
+                  s"${r.httpMethod} ${r.endpointUrl}<br>${r.responseStatus.map(_.toString).getOrElse("...")} · ${r.durationMs.map(d => s"${d}ms").getOrElse("...")}"
+                }
+                gridItems += s"""<div class="pipeline-connector connector-$state" style="grid-column:$connCol;grid-row:1"></div>"""
+                gridItems += pipelineNode(icon, dest, state, sub, tooltip,
+                  style = s"grid-column:$nodeCol;grid-row:1")
               }
 
-              val resultsHtml = if (results.nonEmpty) {
-                // Group results by event type to show which API calls belong to which event
-                val resultsByEvent = results
-                  .groupBy(r => if (r.eventType.endsWith(":REVERT")) r.eventType.replace(":REVERT", "") + ":REVERT" else r.eventType)
-                  .toSeq
-                  .sortBy(_._2.headOption.map(_.publishedAt.toEpochMilli).getOrElse(0L))
+              // Compensation rows (if applicable)
+              val hasFailed = destStates.exists(_._1 == "failed")
 
-                resultsByEvent.map { case (eventType, eventResults) =>
-                  val isRevertEvent = eventType.endsWith(":REVERT")
-                  val cleanEventType = eventType.replace(":REVERT", "")
+              if (hasFailed || hasReverts) {
+                val succeededDests =
+                  if (hasFailed)
+                    destStates
+                      .takeWhile(_._1 != "failed")
+                      .filter(_._1 == "success")
+                      .map(_._2)
+                      .reverse
+                  else
+                    destStates
+                      .filter(_._1 == "success")
+                      .map(_._2)
+                      .reverse
 
-                  val deduplicatedResults = eventResults
-                    .groupBy(_.destination)
-                    .map { case (_, destResults) =>
-                      destResults.maxBy(_.publishedAt)
-                    }
-                    .toSeq
-                    .sortBy(_.fanoutOrder)
+                val compLabel =
+                  if (hasFailed) "Saga Compensation (LIFO)"
+                  else "Saga Compensation — Cancel"
 
-                  val resultsDetails = deduplicatedResults
-                    .map { result =>
-                      val statusColor = if (result.success) "#10B981" else "#EF4444"
-                      val statusIcon  = if (result.success) "✓" else "✗"
-                      val statusCode  = result.responseStatus.map(c => s" ($c)").getOrElse("")
-                      val displayDestination =
-                        if (result.destination.endsWith(".revert"))
-                          result.destination.stripSuffix(".revert")
-                        else
-                          result.destination
-                      val errorMsg = result.errorMessage
-                        .map(msg =>
-                          s"<div style=\"font-size: 0.75rem; color: #EF4444; margin-top: 0.25rem;\">${msg
-                              .take(50)}${if (msg.length > 50) "..." else ""}</div>"
+                val compRow = 3
+
+                // Row 2: bridge drop + label
+                if (hasFailed) {
+                  val failedIdx = destStates.indexWhere(_._1 == "failed")
+                  val failedCol = 2 * failedIdx + 5
+                  gridItems += s"""<div class="comp-drop" style="grid-column:$failedCol;grid-row:2"></div>"""
+                  gridItems += s"""<div class="compensation-label" style="grid-column:1/$failedCol;grid-row:2">$compLabel</div>"""
+                } else {
+                  gridItems += s"""<div class="compensation-label" style="grid-column:1/-1;grid-row:2">$compLabel</div>"""
+                }
+
+                // Row 3: compensation nodes aligned under their forward counterparts
+                // compNodes: (gridCol, state, nodeHtml)
+                val compNodes: Seq[(Int, String, String)] = {
+                  val dlqPart =
+                    if (hasFailed) {
+                      val failedIdx = destStates.indexWhere(_._1 == "failed")
+                      val failedCol = 2 * failedIdx + 5
+                      Seq(
+                        (
+                          failedCol,
+                          "failed",
+                          pipelineNode("⚠️", "DLQ", "failed", "",
+                            style = s"grid-column:$failedCol;grid-row:$compRow")
                         )
-                        .getOrElse("")
-                      s"""
-                    <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0;">
-                      <span style="color: $statusColor; font-weight: bold;">$statusIcon</span>
-                      <span style="font-size: 0.813rem;">$displayDestination$statusCode</span>
-                      $errorMsg
-                    </div>
-                  """
+                      )
+                    } else Seq.empty
+
+                  val destPart = succeededDests.map { dest =>
+                    val idx  = fanoutDests.indexOf(dest)
+                    val col  = 2 * idx + 5
+                    val icon = destIcons.getOrElse(dest, "📋")
+                    val revertResult = revertByDest.get(dest)
+                    val (state, sub) = revertResult match {
+                      case Some(r) if r.success =>
+                        ("reverted", "↩ reverted")
+                      case Some(r) =>
+                        ("failed", s"✗ ${r.responseStatus.map(_.toString).getOrElse("")}")
+                      case None if noRevertDests.contains(dest) =>
+                        ("skipped", "— skipped")
+                      case None if hasReverts =>
+                        ("processing", "...")
+                      case None =>
+                        ("waiting", "")
                     }
-                    .mkString("\n")
-
-                  val eventEmoji = cleanEventType match {
-                    case "OrderCreated" => "✨"
-                    case "OrderStatusUpdated" => "🔄"
-                    case "OrderCancelled" => "❌"
-                    case _ => "📋"
+                    val tooltip = revertResult.map { r =>
+                      s"${r.httpMethod} ${r.endpointUrl}<br>${r.responseStatus.map(_.toString).getOrElse("...")} · ${r.durationMs.map(d => s"${d}ms").getOrElse("...")}"
+                    }
+                    (
+                      col,
+                      state,
+                      pipelineNode(icon, dest, state, sub, tooltip,
+                        style = s"grid-column:$col;grid-row:$compRow")
+                    )
                   }
 
-                  val eventLabel = if (isRevertEvent) {
-                    s"""<span style="color: #9333EA; font-weight: 600;">$eventEmoji Event: $cleanEventType [REVERT]</span>"""
-                  } else {
-                    s"$eventEmoji Event: $cleanEventType"
+                  dlqPart ++ destPart
+                }
+
+                compNodes.zipWithIndex.foreach { case ((col, state, nodeHtml), idx) =>
+                  if (idx > 0) {
+                    val prevCol = compNodes(idx - 1)._1
+                    val connCol = (col + prevCol) / 2
+                    gridItems += s"""<div class="pipeline-connector comp-connector connector-$state" style="grid-column:$connCol;grid-row:$compRow"></div>"""
                   }
+                  gridItems += nodeHtml
+                }
+              }
 
-                  s"""
-              <div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid #E5E7EB;">
-                <div style="font-size: 0.75rem; color: #6B7280; margin-bottom: 0.5rem;">
-                  $eventLabel
-                </div>
-                $resultsDetails
-              </div>
-              """
-                }.mkString("\n")
-              } else ""
+              val gridHtml =
+                s"""<div class="pipeline-grid">${gridItems.mkString("\n")}</div>"""
 
+              // --- Status badge ---
               val statusBadge = order.orderStatus match {
-                case "PENDING" => "" // Don't show PENDING status
+                case "PENDING" => ""
                 case status =>
                   s"""<span class="order-status status-${status.toLowerCase}">$status</span>"""
               }
 
+              // --- Action buttons (same logic as before) ---
+              val buttonsHtml = order.orderStatus match {
+                case "DELIVERED" =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
+                  </div>"""
+                case "SHIPPED" =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-secondary" hx-put="/orders/${order.id}/status" hx-target="#orders" hx-swap="innerHTML" hx-vals='{"status":"DELIVERED"}'>📦 Mark as Delivered</button>
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
+                  </div>"""
+                case "CANCELLED" =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
+                  </div>"""
+                case "PENDING" if forwardResults.isEmpty =>
+                  s"""<div class="pipeline-actions">
+                    <div style="font-size: 0.875rem; color: #6B7280; font-style: italic;">Publishing in progress...</div>
+                  </div>"""
+                case "PENDING" if allSucceeded =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-secondary" hx-put="/orders/${order.id}/status" hx-target="#orders" hx-swap="innerHTML" hx-vals='{"status":"SHIPPED"}'>🚚 Mark as Shipped</button>
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/cancel" hx-target="#orders" hx-swap="innerHTML">Cancel</button>
+                  </div>"""
+                case "PENDING" if allFailed =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
+                  </div>"""
+                case "PENDING" if hasReverts =>
+                  s"""<div class="pipeline-actions">
+                    <button class="btn-danger" hx-delete="/orders/${order.id}/delete" hx-target="#orders" hx-swap="innerHTML">Remove</button>
+                  </div>"""
+                case _ =>
+                  s"""<div class="pipeline-actions">
+                    <div style="font-size: 0.875rem; color: #EF4444; font-style: italic;">Processing...</div>
+                  </div>"""
+              }
+
+              // --- Assemble pipeline card ---
               s"""
-          <div class="order-item">
-            <div class="order-header">
-              <span class="order-id">Order #${order.id}</span>
-              $statusBadge
-            </div>
-            <div style="color: #718096; font-size: 0.875rem;">
-              <div>Customer: ${order.customerId}</div>
-              <div>Amount: $$${order.totalAmount}</div>
-              <div>Shipping: ${order.shippingType.capitalize}</div>
-            </div>
-            $resultsHtml
-            $buttonsHtml
-          </div>
-          """
+              <div class="pipeline-card">
+                <div class="pipeline-header">
+                  <div>
+                    <span class="order-id">Order #${order.id}</span>
+                    <span class="pipeline-meta">${order.customerId} · $$${order.totalAmount} · ${order.shippingType.capitalize}</span>
+                  </div>
+                  $statusBadge
+                </div>
+                $gridHtml
+                $buttonsHtml
+              </div>"""
             }
             .mkString("\n")
 
