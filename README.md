@@ -1,4 +1,4 @@
-# Never Call APIs Inside Database Transactions
+# Never Call APIs Inside Database Transactions(English)
 
 > **TL;DR:** Never call external APIs inside a database transaction. If the external call succeeds but the DB commit fails, you end up with an inconsistent state you cannot roll back. This project is a complete, working implementation of **Transactional Outbox + Result Table + Saga Compensation** in Scala with Play Framework, Slick, and Pekko.
 
@@ -560,3 +560,568 @@ With them, those inconsistencies become structurally impossible. The failures yo
 - **Slick** — type-safe database access (`DBIO[T]` for composable transactions)
 - **Apache Pekko** — actor-based background processing
 - **PostgreSQL** — `FOR UPDATE SKIP LOCKED`, `LISTEN/NOTIFY`, JSONB, partial indexes
+
+
+
+# データベーストランザクション内でAPIを呼ぶな(日本語)
+
+> **要約:** データベーストランザクション内で外部APIを呼んではいけない。外部呼び出しが成功してDBのコミットが失敗した場合、ロールバックできない不整合な状態が残る。本プロジェクトは **Transactional Outbox + Result Table + Saga Compensation** の完全な動作実装を、Play Framework・Slick・Pekkoを使ったScalaで提供する。
+
+---
+
+## クイックスタート
+
+```bash
+git clone https://github.com/hanishi/never-call-apis-inside-database-transactions
+cd never-call-apis-inside-database-transactions
+docker-compose up -d postgres
+sbt run
+# http://localhost:9000 をブラウザで開く
+```
+
+プロジェクトには、失敗率を設定できるシミュレートされた外部サービス（在庫・請求・配送・不正チェック）、注文の作成や障害の再現ができるインタラクティブなUI、すべてのAPI呼び出しの完全な監査ログが含まれている。
+
+---
+
+## このプロジェクトについて
+
+データベースに書き込みつつ外部APIも呼び出すアプリケーションは、気づいていなくても整合性の問題を抱えている。[Transactional Outboxパターン](https://microservices.io/patterns/data/transactional-outbox.html)と[Sagaパターン](https://microservices.io/patterns/data/saga.html)はよく知られた解決策だが、理論で終わっている解説がほとんどだ。このプロジェクトはそこで止まらない。
+
+連携して機能する3つのパターンの**完全な動作実装**を提供する:
+
+1. **Transactional Outbox** — アプリがクラッシュしてもすべてのイベントが処理されることを保証する
+2. **Result Table** — すべてのAPI呼び出し、そのレスポンス、取り消しに必要なIDを記録する
+3. **Saga Compensation** — 4ステップ中の4番目が失敗したとき、1〜3を正しい順序で自動的に取り消す
+
+実装にはPlay Framework・Scala 3・PostgreSQL・Slick・Pekkoアクターを使用しているが、パターン自体は**言語やフレームワークに依存しない**。SlickをJPAに、PekkoをバックグラウンドジョブフレームワークにPlayを何に置き換えても構わない。データベーススキーマ、イベントのライフサイクル、LIFOによる補償ロジック、すべてそのまま移植できる。
+
+---
+
+## なぜこれが必要か
+
+以下のいずれかに該当するシステムは、デュアルライト問題を抱えている:
+
+- データベースへの書き込みと同時に、別システムの状態を変える外部APIを呼び出している（決済ゲートウェイへの課金、在庫の確保、配送のスケジュール登録、Kafkaへのパブリッシュなど）。信用スコアの取得のような読み取り専用の呼び出しはデュアルライト問題を引き起こさない。取り消すべき相手側の状態がないからだ。
+- 単一のビジネスオペレーションで複数サービスを連携させている（例: 在庫確保 → 不正チェック → 配送手配 → 課金）
+- 複数ステップの処理の途中で失敗したとき、完了済みの処理を取り消す必要がある
+
+これらのパターンがなければ、いずれ次のような事態に直面する: 課金は成功したが注文がDBに存在しない、幽霊注文のために在庫が確保されたまま、キャンセルされた取引の配送がスケジュールされている。Outboxパターンはこうした不整合を、運に頼るのではなく設計によって排除する。
+
+---
+
+## 問題: なぜ壊れるのか
+
+ECシステムを構築しているとしよう。顧客が注文を確定したとき、次の処理が必要だ:
+
+1. 注文をデータベースに保存する
+2. 在庫を確保する
+3. 配送を手配する
+4. 顧客に課金する
+
+Slickには便利な抜け道がある。`DBIO.from()`は任意の`Future`を`DBIO`に持ち上げるため、`for`内包表記でデータベース操作と並べてチェーンできる。ScalaのHTTPライブラリは通常`Future[T]`を返すため、HTTPコールをラップして`.transactionally`ブロック内に含めたくなる。コードはコンパイルでき、型も合い、すべてトランザクションで保護されているように*見える*:
+
+```scala
+db.run {
+  (for {
+    orderId <- orders += order                              // DB書き込み
+    _       <- DBIO.from(inventoryApi.reserve(orderId))     // DBIOにラップしたHTTPコール
+    _       <- DBIO.from(shippingApi.schedule(orderId))     // DBIOにラップしたHTTPコール
+    _       <- DBIO.from(billingApi.charge(orderId))        // DBIOにラップしたHTTPコール
+    _       <- shipments += Shipment(orderId, shippingRes)  // DB書き込み
+  } yield orderId).transactionally
+}
+```
+
+しかし実際はそうではない。データベーストランザクションが制御できるのは*データベース*操作だけだ。`DBIO.from()`内のHTTPコールはトランザクションの観点ではfire-and-forgetで、呼び出された瞬間に副作用が確定し、データベースにはそれを取り消す手段がない。最後のDB書き込みが失敗したとき何が起きるか:
+
+1. 注文をINSERT → 成功
+2. 在庫APIを呼び出す → 200 OK（在庫確保済み）
+3. 配送APIを呼び出す → 200 OK（配送手配済み）
+4. 課金APIを呼び出す → 200 OK（顧客への課金完了）
+5. 配送レコードをINSERT → **失敗**（デッドロック、ネットワークエラー、原因は何でもいい）
+6. トランザクションがロールバック
+
+**結果:** 顧客は課金され、配送は手配され、在庫は確保されている……が、データベースに注文は存在しない。外部APIはトランザクションが失敗したことを知らない。すでに処理を完了してしまっている。
+
+呼び出しを分離しても解決しない:
+
+```scala
+// ステップ1: データベースに保存
+val orderId = db.run(orders += order).transactionally  // ✅ 成功
+
+// ステップ2: 外部サービスを呼び出す
+inventoryApi.reserve(orderId)   // ✅ 成功
+shippingApi.schedule(orderId)   // ❌ ここでアプリがクラッシュ。配送は呼ばれない
+billingApi.charge(orderId)      // ❌ 実行されない
+```
+
+ステップ1とステップ2の間でアプリがクラッシュすれば、注文は保存されているが他は何も起きない。`orderId`はメモリから失われているため、リトライは二度と実行されない。
+
+**根本的な問題:** 分散システムをまたぐトランザクションは存在しない。データベースは自身の行に対して原子性を保証できるが、HTTP API・Kafkaブローカー・サードパーティ決済ゲートウェイには何の権限も持たない。各システムは独立してコミットし、独立して失敗し、他のシステムが何をしているか知る術がない。
+
+---
+
+## 解決策: Transactional Outbox + Result Table + Saga Compensation
+
+修正はシンプルだ: **リクエスト中に外部APIを呼ぶのをやめる。代わりに、必要なことをデータベースに記録し、バックグラウンドワーカーに後で呼ばせる。**
+
+外部APIを直接呼ぶ代わりに、注文と同じデータベーストランザクション内で`outbox_events`テーブルに1行INSERTする:
+
+```sql
+BEGIN;
+  INSERT INTO orders (customer_id, total_amount, ...) VALUES ('C-123', 99.99, ...);
+  INSERT INTO outbox_events (event_type, payloads, status) VALUES ('OrderCreated', '{...}', 'PENDING');
+COMMIT;
+```
+
+両方の行が保存されるか、どちらも保存されないかのどちらかだ。このトランザクション中にAPIコールは一切行われない。
+
+バックグラウンドのPekkoアクター（`OutboxProcessor`）がこのテーブルを監視し続ける。`PENDING`なイベントを見つけたら、それを取得して実際のHTTPコールを行い、`PROCESSED`としてマークする。ワーカーが処理する前にアプリがクラッシュしても、イベントはデータベースに残っている。再起動時にワーカーが拾い上げる。
+
+| パターン                     | 解決する問題          | アプローチ                                     |
+|------------------------------|-----------------------|------------------------------------------------|
+| **Transactional Outbox**     | デュアルライト問題    | 注文とイベントを同一トランザクションでDB書き込み |
+| **Result Table**             | 「何を取り消すか」    | すべてのAPI呼び出しとレスポンスを記録           |
+| **Saga Compensation**        | 部分的な失敗          | 成功した呼び出しをLIFO順に取り消す             |
+
+---
+
+## データベーススキーマ
+
+### `orders` — ビジネスデータ
+
+```sql
+CREATE TABLE orders (
+    id            BIGSERIAL PRIMARY KEY,
+    customer_id   VARCHAR(255)   NOT NULL,
+    total_amount  DECIMAL(10, 2) NOT NULL,
+    shipping_type VARCHAR(20)    NOT NULL DEFAULT 'domestic',
+    order_status  VARCHAR(50)    NOT NULL DEFAULT 'PENDING',
+    created_at    TIMESTAMP      NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMP      NOT NULL DEFAULT NOW(),
+    deleted       BOOLEAN        NOT NULL DEFAULT FALSE
+);
+```
+
+### `outbox_events` — TODOリスト
+
+```sql
+CREATE TABLE outbox_events (
+    id                BIGSERIAL PRIMARY KEY,
+    aggregate_id      VARCHAR(255)  NOT NULL,
+    event_type        VARCHAR(255)  NOT NULL,
+    payloads          JSONB         NOT NULL,
+    status            VARCHAR(20)   NOT NULL DEFAULT 'PENDING',
+    retry_count       INT           NOT NULL DEFAULT 0,
+    idempotency_key   VARCHAR(512)  NOT NULL,
+    next_retry_at     TIMESTAMP WITH TIME ZONE
+);
+
+CREATE UNIQUE INDEX idx_outbox_idempotency
+    ON outbox_events (idempotency_key)
+    WHERE status != 'PROCESSED';
+```
+
+### `aggregate_results` — 監査ログ
+
+```sql
+CREATE TABLE aggregate_results (
+    id               BIGSERIAL PRIMARY KEY,
+    aggregate_id     VARCHAR(255)  NOT NULL,
+    destination      VARCHAR(255)  NOT NULL,
+    request_payload  JSONB,
+    response_payload JSONB,
+    success          BOOLEAN       NOT NULL,
+    fanout_order     INT           NOT NULL DEFAULT 0
+);
+```
+
+### `dead_letter_events` — 補償待ちの失敗イベント
+
+```sql
+CREATE TABLE dead_letter_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    original_event_id  BIGINT        NOT NULL,
+    aggregate_id       VARCHAR(255)  NOT NULL,
+    event_type         VARCHAR(255)  NOT NULL,
+    payloads           JSONB         NOT NULL,
+    status             VARCHAR(20)   NOT NULL DEFAULT 'PENDING',
+    reason             VARCHAR(1024) NOT NULL
+);
+```
+
+---
+
+## イベントのアトミックな書き込み
+
+各ビジネスオペレーションはドメインイベントを生成し、そのイベントは宛先とそれぞれに必要なデータを知っている:
+
+```scala
+case class OrderCreatedEvent(
+    orderId: Long, customerId: String,
+    totalAmount: BigDecimal, shippingType: String,
+    timestamp: Instant = Instant.now()
+) extends DomainEvent {
+  override def aggregateId = orderId.toString
+  override def eventType   = "OrderCreated"
+
+  override def toPayloads = Map(
+    "inventory" -> DestinationConfig(payload = Some(Json.obj(
+      "orderId" -> orderId, "totalAmount" -> totalAmount, "shippingType" -> shippingType
+    ))),
+    "fraudCheck" -> DestinationConfig(payload = Some(Json.obj(
+      "orderId" -> orderId, "customerId" -> customerId, "totalAmount" -> totalAmount
+    ))),
+    "shipping" -> DestinationConfig(payload = Some(Json.obj(
+      "customerId" -> customerId, "shippingType" -> shippingType, "totalAmount" -> totalAmount
+    ))),
+    "billing" -> DestinationConfig(payload = Some(Json.obj(
+      "amount" -> totalAmount, "currency" -> "USD"
+    )))
+  )
+}
+```
+
+`OutboxHelper`トレイトがビジネスアクションとイベントのINSERTを`.transactionally`でラップする:
+
+```scala
+trait OutboxHelper {
+  protected def withEventFactory[T](action: DBIO[T])(eventFactory: T => DomainEvent)
+      (using ec: ExecutionContext): DBIO[T] =
+    (for {
+      result <- action
+      _      <- saveEvent(eventFactory(result))
+    } yield result).transactionally
+}
+```
+
+`OrderRepository`はこれをミックスインする:
+
+```scala
+def createWithEvent(order: Order): DBIO[Long] =
+  withEventFactory((orders returning orders.map(_.id)) += order) { orderId =>
+    OrderCreatedEvent(orderId, order.customerId, order.totalAmount, order.shippingType)
+  }
+```
+
+SQLレベルでは次の処理が行われる:
+
+```sql
+BEGIN;
+  INSERT INTO orders (...) RETURNING id;  -- 123が返る
+  INSERT INTO outbox_events (aggregate_id, event_type, payloads, status)
+    VALUES ('123', 'OrderCreated', '{"inventory": {...}, ...}', 'PENDING');
+COMMIT;
+-- PostgreSQLトリガーが発火: pg_notify('outbox_events_channel', '456')
+```
+
+---
+
+## イベントの処理: OutboxProcessor
+
+`OutboxProcessor`は`FOR UPDATE SKIP LOCKED`を使ってイベントを取得する。これにより、複数のワーカーを並列で動かしても同じイベントを二重処理しない:
+
+```scala
+def findAndClaimUnprocessed(limit: Int = 100): DBIO[Seq[OutboxEvent]] = {
+  sql"""
+    WITH claimed AS (
+      SELECT id FROM outbox_events
+      WHERE status = 'PENDING'
+        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+      ORDER BY created_at
+      LIMIT $limit
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE outbox_events e
+    SET status = 'PROCESSING', status_changed_at = NOW()
+    FROM claimed
+    WHERE e.id = claimed.id
+    RETURNING e.*
+  """.as[OutboxEvent]
+}
+```
+
+失敗した呼び出しは指数バックオフ（2秒・4秒・8秒）でリトライされる。最大リトライ回数を超えると、イベントは補償処理のために`dead_letter_events`に移動する。
+
+固定間隔のポーリングではなく、PostgreSQLトリガーが新しいイベントのINSERT直後にプロセッサへ通知する:
+
+```sql
+CREATE OR REPLACE FUNCTION notify_new_outbox_event() RETURNS trigger AS $$
+BEGIN
+    IF NEW.status = 'PENDING' THEN
+        PERFORM pg_notify('outbox_events_channel', NEW.id::text);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+---
+
+## ファンアウトと条件付きルーティング
+
+ファンアウトの順序と宛先URLは設定ファイルで完全に定義される。宛先の追加やシーケンスの変更にリコンパイルは不要だ:
+
+```hocon
+outbox.http.fanout {
+  OrderCreated       = ["inventory", "fraudCheck", "shipping", "billing"]
+  OrderStatusUpdated = ["notifications"]
+}
+
+outbox.http.routes {
+  inventory {
+    url    = "http://localhost:9000/api/inventory/reserve"
+    method = "POST"
+  }
+
+  shipping {
+    method = "POST"
+    routes = [{
+      url = "http://localhost:9000/api/domestic-shipping"
+      condition { jsonPath = "$.shippingType", operator = "eq", value = "domestic" }
+    }, {
+      url = "http://localhost:9000/api/international-shipping"
+      condition { jsonPath = "$.shippingType", operator = "eq", value = "international" }
+    }]
+  }
+}
+```
+
+条件で使えるオペレーターは `eq`・`ne`・`gt`・`gte`・`lt`・`lte`・`contains`・`exists`。
+
+### デシジョンチェーン
+
+ルーティングを*前の*宛先のレスポンスに基づいて行うこともできる。不正チェックは請求より先に実行されるため、請求はそのリスクスコアに基づいてルーティングできる:
+
+```hocon
+billing {
+  method = "POST"
+  routes = [{
+    url = "http://localhost:9000/api/billing"
+    condition {
+      jsonPath = "$.riskScore"
+      operator = "lt"
+      value    = "50"
+      previousDestination = "fraudCheck"
+    }
+  }, {
+    url = "http://localhost:9000/api/high-value-processing"
+    condition {
+      jsonPath = "$.riskScore"
+      operator = "gte"
+      value    = "50"
+      previousDestination = "fraudCheck"
+    }
+  }]
+}
+```
+
+パブリッシャーは各宛先の呼び出し後にレスポンスを蓄積する`RoutingContext`を保持し、後続のルーティング判断で参照できるようにしている。
+
+---
+
+## 設定ドリブンなリバートエンドポイント
+
+各宛先は、フォワード呼び出しの取り消し方法を宣言する`revert`ブロックを持てる。値はJSONPathを使って保存済みのリクエストまたはレスポンスから抽出され、リバートURLとペイロードのプレースホルダーに代入される:
+
+```hocon
+inventory {
+  url    = "http://localhost:9000/api/inventory/reserve"
+  method = "POST"
+
+  revert {
+    url    = "http://localhost:9000/api/inventory/{reservationId}/release"
+    method = "DELETE"
+    extract {
+      reservationId = "response:$.reservationId"
+    }
+  }
+}
+
+shipping {
+  routes = [{
+    url = "http://localhost:9000/api/domestic-shipping"
+    condition { jsonPath = "$.shippingType", operator = "eq", value = "domestic" }
+
+    revert {
+      url    = "http://localhost:9000/api/domestic-shipping/{shipmentId}/cancel"
+      method = "POST"
+      extract {
+        shipmentId = "response:$.shipmentId"
+        orderId    = "response:$.orderId"
+        customerId = "request:$.customerId"
+      }
+      payload = """{"reason": "payment_failed", "shipmentId": "{shipmentId}",
+                    "orderId": "{orderId}", "customerId": "{customerId}"}"""
+    }
+  }]
+}
+```
+
+フォワード呼び出しのレスポンスが`{"shipmentId": "SHIP-789", "orderId": "123"}`でリクエストに`{"customerId": "C-123"}`が含まれていれば、リバート呼び出しは次のようになる:
+
+```
+POST /api/domestic-shipping/SHIP-789/cancel
+{"reason": "payment_failed", "shipmentId": "SHIP-789", "orderId": "123", "customerId": "C-123"}
+```
+
+`revert`ブロックを持たない宛先（`fraudCheck`など）は補償処理でスキップされる。
+
+---
+
+## 自動補償: DLQProcessor
+
+`OutboxProcessor`がリトライを使い果たすと、失敗したイベントを`dead_letter_events`に移動する。`DLQProcessor`（`OutboxProcessor`の子アクターとしてスポーン）がそれを取得し、LIFO順で補償を実行する:
+
+```scala
+private def revertDLQEvent(dlqEvent: DeadLetterEvent): Future[Boolean] = {
+  db.run(
+    resultRepo.findByAggregateId(dlqEvent.aggregateId, Result.Success, includeReverts = false)
+  ).flatMap { successful =>
+    if (successful.isEmpty) {
+      db.run(dlqRepo.markProcessed(dlqEvent.id)).map(_ => true)
+    } else {
+      publishRevertEvent(dlqEvent, successful)  // LIFO順
+    }
+  }
+}
+```
+
+すべてのリバート呼び出しは`aggregate_results`に、宛先名に`.revert`サフィックスを付けて記録される（`"shipping.revert"`など）。補償前にそのエントリが既に存在するか確認し、存在すればスキップする。これにより再起動をまたいでも補償処理が冪等になる。
+
+---
+
+## 手動キャンセル
+
+ユーザーが起点のキャンセルも同じ補償エンジンを再利用する。イベントタイプへの`!`プレフィックスが、`OutboxProcessor`にフォワードモードではなく補償モードで動作するよう伝える:
+
+```scala
+case class OrderCancelledEvent(orderId: Long, reason: String, ...) extends DomainEvent {
+  override def eventType: String = "!OrderCreated"  // ← 補償をトリガー
+}
+```
+
+リポジトリはキャンセルと`!OrderCreated`イベントをアトミックに書き込む:
+
+```scala
+def cancelWithEvent(orderId: Long, reason: String): DBIO[Int] =
+  for {
+    orderOpt <- findById(orderId)
+    _        <- orderOpt match {
+      case Some(_) => DBIO.successful(())
+      case None    => DBIO.failed(new NoSuchElementException(s"Order $orderId not found"))
+    }
+    updated  <- withEvent(OrderCancelledEvent(orderId = orderId, reason = reason)) {
+      orders.filter(_.id === orderId)
+        .map(o => (o.orderStatus, o.updatedAt))
+        .update(("CANCELLED", Instant.now()))
+    }
+  } yield updated
+```
+
+ユーザーがキャンセルを2回クリックしても、2回目のリクエストはすべての宛先が既に補償済みであることを確認してno-opになる。リバートイベント自体が最大リトライ後に失敗した場合、さらなる補償はトリガーされない。無限ループになるからだ。代わりに手動対応が必要な状態としてマークされる。
+
+| 観点               | 手動（`!OrderCreated`）     | 自動（DLQ）                          |
+|--------------------|-----------------------------|--------------------------------------|
+| **トリガー**       | ユーザーアクション          | フォワードAPIが最大リトライ後に失敗  |
+| **テーブル**       | `outbox_events`             | `dead_letter_events`                 |
+| **タイミング**     | 即時                        | リトライ枯渇後                       |
+| **それ自体が失敗** | 手動対応が必要              | 手動対応が必要                       |
+
+---
+
+## 設定
+
+```hocon
+outbox {
+  pollInterval = 2 seconds
+  batchSize    = 100
+  poolSize     = 3
+  maxRetries   = 3
+  useListenNotify = true
+
+  enableStaleEventCleanup  = true
+  staleEventTimeoutMinutes = 5
+  cleanupInterval          = 1 minute
+
+  dlq {
+    maxRetries   = 3
+    pollInterval = 2 seconds
+  }
+}
+```
+
+`poolSize = 3`の場合、3つの`OutboxProcessor`アクターがプールルーターの後ろで並列動作し、それぞれが子`DLQProcessor`を持つ。`FOR UPDATE SKIP LOCKED`により、同じイベントが二重処理されることはない。
+
+---
+
+## 完全なフロー: 課金失敗シナリオ
+
+```
+POST /api/orders {"customerId": "C-123", "totalAmount": 99.99, "shippingType": "domestic"}
+
+1. アトミックな書き込み
+   INSERT INTO orders ...         → id=123
+   INSERT INTO outbox_events ...  → id=456, status=PENDING
+   pg_notifyが即座に発火
+
+2. OutboxProcessorがイベントを取得
+   UPDATE outbox_events SET status='PROCESSING' WHERE id=456
+
+3. ファンアウト呼び出し
+   POST /api/inventory/reserve       → 200 OK {"reservationId": "RES-456"}
+   POST /api/fraud/check             → 200 OK {"riskScore": 25}
+   POST /api/domestic-shipping       → 200 OK {"shipmentId": "SHIP-789"}
+   POST /api/billing                 → 503（3回リトライ、すべて失敗）
+
+4. DLQへ移動
+   INSERT INTO dead_letter_events (aggregate_id='123', reason='MAX_RETRIES_EXCEEDED')
+   UPDATE outbox_events SET status='PROCESSED', moved_to_dlq=true
+
+5. DLQProcessorがLIFO順で補償
+   POST /api/domestic-shipping/SHIP-789/cancel  → 200 OK  → "shipping.revert"として保存
+   fraudCheckをスキップ（revert設定なし）
+   DELETE /api/inventory/RES-456/release        → 200 OK  → "inventory.revert"として保存
+   UPDATE dead_letter_events SET status='PROCESSED'
+```
+
+注文はデータベースに存在する。外部への副作用はすべてクリーンに取り消された。`aggregate_results`にはフォワードとリバートを含むすべてのAPI呼び出しの完全な監査ログが残っている。
+
+---
+
+## 試してみる
+
+```bash
+# 課金を常に失敗させる
+# application.confで設定:
+service.failure.rates {
+  billing.charge = 1.0
+}
+```
+
+試す価値があるシナリオ:
+
+- **ハッピーパス** — 注文を作成し、`aggregate_results`に成功した呼び出しが記録されるのを確認する
+- **自動補償** — 課金の失敗率を100%に設定して注文を作成し、DLQProcessorが配送と在庫をLIFO順に取り消すのを観察する
+- **手動キャンセル** — 正常に完了した注文をキャンセルする。`!OrderCreated`がトリガーされ、すべてのフォワード呼び出しが取り消される
+- **冪等性** — 同じ注文を2回キャンセルする。2回目はno-opになる
+
+---
+
+## 解決しないこと
+
+これらのパターンは分散システムをシンプルにはしない。何もそれはできない。スタックしたイベントを検知するモニタリング、DLQが溜まり始めたときのアラート、自動補償が失敗して人間の介入が必要になるまれなケースへの対応手順は引き続き必要だ。
+
+これらのパターンが変えるのは、障害の*性質*だ。パターンがなければ**データの不整合**が発生する: 課金されたのに注文がない、幽霊注文のために在庫が確保されたまま、キャンセルされた取引の配送が手配されている。こういったバグは深夜3時に叩き起こされ、手作業でのDB修復を要求する。
+
+パターンがあれば、そうした不整合は構造的に起こりえなくなる。代わりに直面する障害——リトライ待ちのDLQイベント、タイムアウトするリバートエンドポイント——はすべて**観測可能で、追跡可能で、回復可能**だ。`aggregate_results`テーブルがすべてのAPI呼び出しの完全な監査ログを提供する。`dead_letter_events`テーブルが何がなぜ失敗したかを正確に教えてくれる。
+
+---
+
+## 技術スタック
+
+- **Scala 3**
+- **Play Framework** — HTTPレイヤーとアプリケーションライフサイクル
+- **Slick** — 型安全なデータベースアクセス（`DBIO[T]`によるトランザクション合成）
+- **Apache Pekko** — アクターベースのバックグラウンド処理
+- **PostgreSQL** — `FOR UPDATE SKIP LOCKED`・`LISTEN/NOTIFY`・JSONB・部分インデックス
