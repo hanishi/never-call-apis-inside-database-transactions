@@ -1,4 +1,4 @@
-# Never Call APIs Inside Database Transactions [日本語](README.md#never-call-apis-inside-database-transactions日本語)
+# Never Call APIs Inside Database Transactions
 
 > **TL;DR:** Never call external APIs inside a database transaction. If the external call succeeds but the DB commit fails, you end up with an inconsistent state you cannot roll back. This project is a complete, working implementation of **Transactional Outbox + Result Table + Saga Compensation** in Scala with Play Framework, Slick, and Pekko.
 
@@ -578,7 +578,7 @@ The Outbox, Result Table, and Saga Compensation patterns in this project are sou
 
 
 
-# データベーストランザクション内でAPIを呼ぶな [English](https://github.com/hanishi/never-call-apis-inside-database-transactions/edit/main/README.md#never-call-apis-inside-database-transactions)
+# データベーストランザクション内でAPIを呼ぶな
 
 > **要約:** データベーストランザクション内で外部APIを呼んではいけない。外部呼び出しが成功してDBのコミットが失敗した場合、ロールバックできない不整合な状態が残る。本プロジェクトは **Transactional Outbox + Result Table + Saga Compensation** の完全な動作実装を、Play Framework・Slick・Pekkoを使ったScalaで提供する。
 
