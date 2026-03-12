@@ -553,6 +553,21 @@ With them, those inconsistencies become structurally impossible. The failures yo
 
 ---
 
+## A Note on the Actor Model Usage
+
+This project uses Pekko Typed actors for the `OutboxProcessor` and `DLQProcessor`. Before treating this as a reference for how to use actors in Play, it is worth being direct about a design problem.
+
+**The `OutboxProcessor` does not need to be an actor.** Its responsibilities are polling a database, making HTTP calls, and writing results back. A simple scheduler with `Future` handles this cleanly. The actor adds nothing here: there is no meaningful state to encapsulate, no supervision hierarchy being leveraged, and no location transparency needed. The self-sent `ProcessUnhandledEvent` message is just a while loop in disguise.
+
+The Play integration compounds this. Because Play exposes only `ActorSystem[Nothing]`, there is no access to the user guardian. The only option is `systemActorOf`, an API intended for infrastructure-level actors, not business logic. This is a structural workaround for Play's constraints, not idiomatic Pekko Typed usage.
+
+This pattern — reaching for actors because the framework happens to include an `ActorSystem` — is widespread in Play codebases, and it consistently creates bottlenecks. Placing an actor in the request path and waiting on it with `ask` serializes work through a single mailbox that `Future`-based code would handle in parallel. Under load, that mailbox becomes the bottleneck.
+
+**The right question before using an actor is always: does this problem actually require the Actor model?** Actors earn their place when you need to encapsulate long-lived mutable state, when you need location transparency across a cluster, or when the supervision hierarchy gives you something a try/catch cannot. A background worker that polls a database and calls HTTP endpoints does not clear that bar.
+
+The Outbox, Result Table, and Saga Compensation patterns in this project are sound. The actor usage is not something to copy.
+
+---
 ## Tech Stack
 
 - **Scala 3**
@@ -1115,6 +1130,22 @@ service.failure.rates {
 これらのパターンが変えるのは、障害の*性質*だ。パターンがなければ**データの不整合**が発生する: 課金されたのに注文がない、幽霊注文のために在庫が確保されたまま、キャンセルされた取引の配送が手配されている。こういったバグは深夜3時に叩き起こされ、手作業でのDB修復を要求する。
 
 パターンがあれば、そうした不整合は構造的に起こりえなくなる。代わりに直面する障害——リトライ待ちのDLQイベント、タイムアウトするリバートエンドポイント——はすべて**観測可能で、追跡可能で、回復可能**だ。`aggregate_results`テーブルがすべてのAPI呼び出しの完全な監査ログを提供する。`dead_letter_events`テーブルが何がなぜ失敗したかを正確に教えてくれる。
+
+---
+
+## Actorモデルの使い方についての注記
+
+このプロジェクトは`OutboxProcessor`と`DLQProcessor`にPekko Typedアクターを使っている。これをPlayでのActorの使い方の参考にする前に、設計上の問題点を率直に書いておく。
+
+**`OutboxProcessor`はActorである必要がない。** その責務はDBのポーリング、HTTPコールの実行、結果の書き戻しだ。これはスケジューラーと`Future`の組み合わせで十分に実現できる。Actorにすることで得られるものは何もない。カプセル化すべき意味のある状態はなく、supervision階層も活用されておらず、場所透過性も不要だ。自分自身への`ProcessUnhandledEvent`メッセージ送信はwhileループを迂回して表現しているに過ぎない。
+
+PlayのActorSystem統合がこれをさらに悪化させている。PlayはDIとして`ActorSystem[Nothing]`しか公開しないため、ユーザーガーディアンへのアクセス手段がない。使える選択肢は`systemActorOf`だけだが、これはビジネスロジックではなくインフラレベルのアクター向けのAPIだ。これはidiomatic Pekko Typedの使い方ではなく、Playの構造的制約に対する回避策だ。
+
+このパターン——フレームワークにたまたま`ActorSystem`が含まれているからActorを使う——はPlayのコードベースに蔓延しており、いたるところにボトルネックを生んでいる。リクエストパスにActorを挟んで`ask`で結果を待つと、`Future`ベースのコードなら並列に処理できる仕事を単一のメールボックスが直列化してしまう。負荷が上がったとき、そのメールボックスがボトルネックになる。
+
+**Actorを使う前に問うべき正しい問いは「この問題はActorモデルを本当に必要としているか」だ。** Actorが価値を発揮するのは、長期間保持される可変状態のカプセル化が必要なとき、クラスタをまたいだ場所透過性が必要なとき、supervision階層がtry/catchでは実現できない障害管理を提供するときだ。DBをポーリングしてHTTPを呼ぶバックグラウンドワーカーはその条件を満たさない。
+
+このプロジェクトのOutbox・Result Table・Saga Compensationパターンは正しい。Actorの使い方はコピーすべきではない。
 
 ---
 
